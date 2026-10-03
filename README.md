@@ -1,4 +1,4 @@
-# Indian Hotel Management System
+# Hotel Management System
 
 ## Windows setup
 
