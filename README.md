@@ -1,4 +1,4 @@
-# Hotel Management System
+# Hotel Reservation System
 
 ## Windows setup
 
