@@ -1,7 +1,7 @@
 """
 generate_data.py
 Generates data.sql with Indian sample data for hotel_db:
-  1 hotel, 4 room types, 300 rooms, 1000+ guests, reservations, payments.
+  several hotels, room types, 300 rooms, 1000+ guests, reservations, payments.
 Usage:  python generate_data.py          (creates data.sql)
 Change NUM_GUESTS / NUM_RESERVATIONS below if you want more rows.
 All phone numbers and ID numbers are random/masked, not real people.
@@ -46,6 +46,8 @@ email_domains = ["gmail.com", "yahoo.in", "outlook.com", "rediffmail.com"]
 
 hotels = [
     ("AthitiStay", "12 Rajwada Road", "Indore", "Mr. Ramesh Chandra"),
+    ("Ganga Palace", "8 MG Road", "Bhopal", "Ms. Kavita Sharma"),
+    ("Pink City Inn", "21 MI Road", "Jaipur", "Mr. Arjun Mehta"),
 ]
 room_types = [("Single", 600), ("Double", 1000), ("Triple", 1400),
               ("Deluxe AC", 2000), ("Duplex", 3000)]
@@ -65,14 +67,16 @@ out.append(",\n".join(f"('{esc(n)}', '{esc(a)}', '{c}', '{esc(w)}')" for n, a, c
 out.append("INSERT INTO RoomType (type_name, rent_per_day) VALUES")
 out.append(",\n".join(f"('{n}', {r})" for n, r in room_types) + ";\n")
 
-# Rooms: 300 rooms in the single hotel; room_id k has type ((k-1) % 4) + 1
+# Rooms use floor-style numbers such as 101 and 201.
 rooms = []
 rid = 0
 for h in range(1, len(hotels) + 1):
     for n in range(1, 301):
         rid += 1
         t = (rid - 1) % len(room_types) + 1
-        rooms.append((rid, h, t, f"{h}0{n}", capacities[t - 1]))
+        floor = 100 + ((n - 1) // 100) * 100
+        room_number = floor + ((n - 1) % 100) + 1
+        rooms.append((rid, h, t, str(room_number), capacities[t - 1]))
 out.append("INSERT INTO Room (hotel_id, type_id, room_no, capacity, status) VALUES")
 out.append(",\n".join(f"({h}, {t}, '{no}', {cap}, 'Available')" for _, h, t, no, cap in rooms) + ";\n")
 
@@ -100,19 +104,25 @@ rows = [f"('{esc(n)}', '{p}', '{e}', '{c}', '{s}', '{t}', '{no}')" for n, p, e, 
 out.append(",\n".join(rows) + ";\n")
 
 # Reservations + payments
-statuses = ["Booked", "Checked-in", "Cancelled", "Completed"]
-weights = [15, 10, 10, 65]
+today = date.today()
 modes = ["Cash", "UPI", "Card", "Net Banking"]
 mode_w = [20, 55, 15, 10]
 start = date(2025, 1, 1)
 res_rows, pay_rows = [], []
+room_ends = {room_id: date(2025, 1, 1) for room_id, *_ in rooms}
 for r in range(1, NUM_RESERVATIONS + 1):
     guest = random.randint(1, NUM_GUESTS)
     room_id, _, t, _, _ = random.choice(rooms)
-    cin = start + timedelta(days=random.randint(0, 640))
+    cin = max(start + timedelta(days=random.randint(0, 640)), room_ends[room_id] + timedelta(days=1))
     days = random.randint(1, 10)
     cout = cin + timedelta(days=days)
-    status = random.choices(statuses, weights)[0]
+    if cout < today:
+        status = random.choice(["Completed", "Completed", "Cancelled"])
+    elif cin <= today < cout:
+        status = random.choice(["Booked", "Checked-in"])
+    else:
+        status = "Booked"
+    room_ends[room_id] = cout
     res_rows.append(f"({guest}, {room_id}, '{cin}', '{cout}', '{status}')")
     if status != "Cancelled":
         amount = days * room_types[t - 1][1]

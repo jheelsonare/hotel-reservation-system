@@ -1,13 +1,18 @@
 """Indian Hotel Management System - Flask/MySQL application."""
 import os
+import secrets
+import hmac
 from datetime import date, datetime
 from decimal import Decimal
 from functools import wraps
+from urllib.parse import urlencode
 
 import mysql.connector
-from flask import Flask, flash, redirect, render_template, request, url_for
+from dotenv import load_dotenv
+from flask import Flask, flash, redirect, render_template, request, session, url_for
 from mysql.connector import Error
 
+load_dotenv()
 app = Flask(__name__)
 app.secret_key = os.getenv("SECRET_KEY", "change-this-secret")
 DB_CONFIG = {
@@ -24,6 +29,11 @@ ENTITIES = {
     "rooms": ("Room", "room_id", ["hotel_id", "type_id", "room_no", "capacity", "status"]),
     "reservations": ("Reservation", "reservation_id", ["guest_id", "room_id", "check_in", "check_out", "status"]),
     "payments": ("Payment", "payment_id", ["reservation_id", "amount", "payment_date", "mode"]),
+}
+FIELD_CHOICES = {
+    ("rooms", "status"): ["Available", "Maintenance"],
+    ("reservations", "status"): ["Booked", "Checked-in", "Cancelled", "Completed"],
+    ("payments", "mode"): ["Cash", "UPI", "Card", "Net Banking"],
 }
 
 
@@ -68,8 +78,8 @@ def safe_db(fn):
             return fn(*args, **kwargs)
         except Error as exc:
             app.logger.exception("Database operation failed")
-            flash("Database error: " + str(exc), "error")
-            return redirect(request.referrer or url_for("dashboard"))
+            flash("The database could not complete that operation. Please check the values and try again.", "error")
+            return redirect(url_for("dashboard"))
     return wrapped
 
 
@@ -107,6 +117,21 @@ def globals_for_templates():
     return {"today": date.today().isoformat(), "entities": ENTITIES}
 
 
+@app.context_processor
+def csrf_for_templates():
+    token = session.get("csrf_token")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["csrf_token"] = token
+    return {"csrf_token": token}
+
+
+def valid_csrf():
+    token = request.form.get("csrf_token", "")
+    expected = session.get("csrf_token", "")
+    return bool(token and expected and hmac.compare_digest(token, expected))
+
+
 @app.route("/")
 def dashboard():
     counts = {"guests": 0, "rooms": 0, "available_rooms": 0,
@@ -114,7 +139,7 @@ def dashboard():
     try:
         counts["guests"] = query("SELECT COUNT(*) n FROM Guest", one=True)["n"]
         counts["rooms"] = query("SELECT COUNT(*) n FROM Room", one=True)["n"]
-        counts["available_rooms"] = query("SELECT COUNT(*) n FROM Room WHERE status='Available'", one=True)["n"]
+        counts["available_rooms"] = query("SELECT COUNT(*) n FROM available_rooms_view", one=True)["n"]
         counts["active_reservations"] = query(
             "SELECT COUNT(*) n FROM Reservation WHERE status IN ('Booked','Checked-in')",
             one=True)["n"]
@@ -152,8 +177,15 @@ def page_data(key):
     if sort not in fields + [pk]:
         sort = pk
     where, params = "", []
+    from_sql = f"`{table}`"
+    alias = ""
+    if key == "reservations":
+        from_sql = "Reservation r JOIN Room rm ON rm.room_id=r.room_id"
+        alias = "r."
     if search:
-        where = " WHERE " + " OR ".join(f"CAST(`{f}` AS CHAR) LIKE %s" for f in fields)
+        where = " WHERE (" + " OR ".join(
+            f"CAST({alias}`{f}` AS CHAR) LIKE %s" for f in fields
+        ) + ")"
         params = [f"%{search}%"] * len(fields)
     clauses = []
     if key == "reservations":
@@ -171,18 +203,19 @@ def page_data(key):
             clauses.append("r.check_out <= %s"); params.append(end)
         if clauses:
             where = (" WHERE " if not where else where + " AND ") + " AND ".join(clauses)
-        from_sql = "Reservation r JOIN Room rm ON rm.room_id=r.room_id" if clauses else "Reservation"
-    else:
-        from_sql = f"`{table}`"
     total = query(f"SELECT COUNT(*) AS n FROM {from_sql}{where}", params, one=True)["n"]
     offset = (page - 1) * PAGE_SIZE
-    select_sql = "SELECT r.*" if key == "reservations" and clauses else "SELECT *"
-    order_column = f"r.`{sort}`" if key == "reservations" and clauses else f"`{sort}`"
-    rows = query(f"{select_sql} FROM {from_sql}{where} ORDER BY {order_column} LIMIT %s OFFSET %s",
+    select_sql = "SELECT r.*" if key == "reservations" else "SELECT *"
+    order_column = f"{alias}`{sort}`"
+    if key == "rooms" and sort == "room_no":
+        order_column = "CAST(`room_no` AS UNSIGNED)"
+    rows = query(f"{select_sql} FROM {from_sql}{where} ORDER BY {order_column}, {alias}`{pk}` LIMIT %s OFFSET %s",
                  params + [PAGE_SIZE, offset])
     extra = {"status": request.args.get("status", ""), "hotel": request.args.get("hotel", ""),
              "start": request.args.get("start", ""), "end": request.args.get("end", "")}
-    return table, pk, fields, rows, page, (total + PAGE_SIZE - 1) // PAGE_SIZE, search, sort, extra, total
+    query_args = {"q": search, "sort": sort, **{k: v for k, v in extra.items() if v}}
+    return (table, pk, fields, rows, page, (total + PAGE_SIZE - 1) // PAGE_SIZE,
+            search, sort, extra, total, urlencode(query_args))
 
 
 @app.route("/<key>")
@@ -191,8 +224,9 @@ def listing(key):
     if key not in ENTITIES:
         return redirect(url_for("dashboard"))
     data = page_data(key)
-    values = dict(zip(("table", "pk", "fields", "rows", "page", "pages", "search", "sort", "filters", "total"), data))
+    values = dict(zip(("table", "pk", "fields", "rows", "page", "pages", "search", "sort", "filters", "total", "query_string"), data))
     values["hotels"] = query("SELECT hotel_id, hotel_name FROM Hotel ORDER BY hotel_name") if key == "reservations" else []
+    values["field_choices"] = FIELD_CHOICES
     return render_template("list.html", key=key, **values)
 
 
@@ -204,7 +238,13 @@ def edit(key, item_id=None):
         return redirect(url_for("dashboard"))
     table, pk, fields = ENTITIES[key]
     record = query(f"SELECT * FROM `{table}` WHERE `{pk}`=%s", (item_id,), one=True) if item_id else {}
+    if item_id and not record:
+        flash(f"{table} not found.", "error")
+        return redirect(url_for("listing", key=key))
     if request.method == "POST":
+        if not valid_csrf():
+            flash("Your form expired. Please try again.", "error")
+            return redirect(request.url)
         values = [request.form.get(field, "").strip() or None for field in fields]
         error = validate(key, values)
         if error:
@@ -218,8 +258,18 @@ def edit(key, item_id=None):
                         ") VALUES (" + ",".join(["%s"] * len(fields)) + ")", values)
             flash(f"{table} saved.", "success")
             return redirect(url_for("listing", key=key))
+    foreign_options = {}
+    if key == "rooms":
+        foreign_options[("rooms", "hotel_id")] = query("SELECT hotel_id id, hotel_name label FROM Hotel ORDER BY hotel_name")
+        foreign_options[("rooms", "type_id")] = query("SELECT type_id id, type_name label FROM RoomType ORDER BY type_name")
+    elif key == "reservations":
+        foreign_options[("reservations", "guest_id")] = query("SELECT guest_id id, CONCAT(name, ' (#', guest_id, ')') label FROM Guest ORDER BY name, guest_id")
+        foreign_options[("reservations", "room_id")] = query("SELECT room_id id, CONCAT(room_no, ' (#', room_id, ')') label FROM Room ORDER BY CAST(room_no AS UNSIGNED), room_id")
+    elif key == "payments":
+        foreign_options[("payments", "reservation_id")] = query("SELECT reservation_id id, CONCAT('#', reservation_id, ' ', check_in, ' to ', check_out) label FROM Reservation ORDER BY check_in DESC, reservation_id DESC")
     return render_template("form.html", key=key, table=table, pk=pk, fields=fields,
-                           record=record, item_id=item_id)
+                           record=record, item_id=item_id,
+                           field_choices=FIELD_CHOICES, foreign_options=foreign_options)
 
 
 def validate(key, values):
@@ -235,74 +285,33 @@ def validate(key, values):
             return "Guest, room, check-in and check-out are required."
         if str(values[2]) >= str(values[3]):
             return "Check-out must be after check-in."
+        if values[4] in ("Booked", "Checked-in") and str(values[2]) < date.today().isoformat():
+            return "Active reservations cannot start in the past."
+        if values[4] not in FIELD_CHOICES[("reservations", "status")]:
+            return "Choose a valid reservation status."
+    if key == "rooms" and values[4] not in FIELD_CHOICES[("rooms", "status")]:
+        return "Choose Available or Maintenance for room status."
+    if key == "payments" and values[3] not in FIELD_CHOICES[("payments", "mode")]:
+        return "Choose a valid payment mode."
     return None
 
 
 @app.post("/<key>/<int:item_id>/delete")
 @safe_db
 def delete(key, item_id):
+    if not valid_csrf():
+        flash("Your form expired. Please try again.", "error")
+        return redirect(url_for("listing", key=key))
     if key in ENTITIES:
         table, pk, _ = ENTITIES[key]
-        if key == "guests":
-            conn = cur = None
-            try:
-                conn = connection()
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT room_id FROM Reservation WHERE guest_id=%s FOR UPDATE",
-                    (item_id,),
-                )
-                room_ids = sorted({row[0] for row in cur.fetchall()})
-                cur.execute(
-                    """DELETE FROM Payment
-                    WHERE reservation_id IN (
-                        SELECT reservation_id FROM Reservation WHERE guest_id=%s
-                    )""",
-                    (item_id,),
-                )
-                cur.execute("DELETE FROM Reservation WHERE guest_id=%s", (item_id,))
-                if room_ids:
-                    placeholders = ", ".join(["%s"] * len(room_ids))
-                    cur.execute(
-                        f"""UPDATE Room rm
-                        LEFT JOIN (
-                            SELECT room_id, COUNT(*) AS active_count
-                            FROM Reservation
-                            WHERE status IN ('Booked', 'Checked-in')
-                            GROUP BY room_id
-                        ) active ON active.room_id=rm.room_id
-                        SET rm.status=CASE
-                            WHEN COALESCE(active.active_count, 0) >= rm.capacity
-                            THEN 'Full' ELSE 'Available' END
-                        WHERE rm.room_id IN ({placeholders})
-                          AND rm.status <> 'Maintenance'""",
-                        room_ids,
-                    )
-                cur.execute("DELETE FROM Guest WHERE guest_id=%s", (item_id,))
-                if not cur.rowcount:
-                    conn.rollback()
-                    flash("Guest not found.", "error")
-                    return redirect(url_for("listing", key=key))
-                conn.commit()
-            except Error as exc:
-                if conn:
-                    conn.rollback()
-                if getattr(exc, "errno", None) in (1451, 1452):
-                    flash("This guest has related records that could not be deleted.", "error")
-                    return redirect(url_for("listing", key=key))
-                raise
-            finally:
-                if cur:
-                    cur.close()
-                if conn:
-                    conn.close()
-        else:
+        try:
             execute(f"DELETE FROM `{table}` WHERE `{pk}`=%s", (item_id,))
-        flash(
-            "Guest and related reservations and payments deleted."
-            if key == "guests" else "Record deleted.",
-            "success",
-        )
+        except Error as exc:
+            if getattr(exc, "errno", None) == 1451:
+                flash("This record has related history and cannot be deleted.", "error")
+                return redirect(url_for("listing", key=key))
+            raise
+        flash("Record deleted.", "success")
     return redirect(url_for("listing", key=key))
 
 
@@ -310,6 +319,9 @@ def delete(key, item_id):
 @safe_db
 def book():
     if request.method == "POST":
+        if not valid_csrf():
+            flash("Your form expired. Please try again.", "error")
+            return redirect(url_for("book"))
         guest_id = request.form.get("guest_id", type=int)
         new_guest = request.form.get("new_guest") == "1"
         room_type_id = request.form.get("room_type_id", type=int)
@@ -327,6 +339,8 @@ def book():
                 flash(guest_error, "error")
         if (not guest_id and not new_guest) or not room_type_id or not check_in or not check_out:
             flash("Enter valid booking details and dates.", "error")
+        elif check_in < date.today().isoformat():
+            flash("Check-in cannot be in the past.", "error")
         elif check_in >= check_out:
             flash("Check-out must be after check-in.", "error")
         elif not guest_error:
@@ -343,7 +357,7 @@ def book():
                           AND r.status IN ('Booked','Checked-in')
                           AND r.check_in < %s AND r.check_out > %s
                       )
-                    ORDER BY rm.room_no LIMIT 1 FOR UPDATE""",
+                    ORDER BY CAST(rm.room_no AS UNSIGNED), rm.room_id LIMIT 1 FOR UPDATE""",
                             (room_type_id, check_out, check_in))
                 room = cur.fetchone()
                 if not room:
@@ -370,14 +384,14 @@ def book():
                 if getattr(exc, "errno", None) == 1062:
                     flash("A guest with that phone number or email already exists.", "error")
                 else:
-                    flash("Booking failed: " + str(exc), "error")
+                    flash("Booking failed. Check the dates, guest, and room availability.", "error")
             finally:
                 if cur:
                     cur.close()
                 if conn:
                     conn.close()
             return redirect(url_for("book"))
-    guests = query("SELECT guest_id,name FROM Guest ORDER BY name LIMIT 1000")
+    guests = query("SELECT guest_id,name FROM Guest ORDER BY name, guest_id")
     room_types = query("SELECT type_id, type_name, rent_per_day FROM RoomType ORDER BY rent_per_day")
     return render_template("reservation_form.html", guests=guests, room_types=room_types)
 
@@ -408,20 +422,24 @@ def reports():
         ("Aggregate - bookings by city/state", """SELECT c.city,c.state,COUNT(*) bookings
          FROM Guest c JOIN Reservation r ON r.guest_id=c.guest_id
          GROUP BY c.city,c.state HAVING COUNT(*) > 1 ORDER BY bookings DESC LIMIT 50"""),
-        ("Subquery - guests paying above average", """SELECT c.guest_id,c.name,SUM(p.amount) total_paid
+        ("Subquery - guests paying above average", """WITH guest_totals AS (
+         SELECT c.guest_id,c.name,SUM(p.amount) total_paid
          FROM Guest c JOIN Reservation r ON r.guest_id=c.guest_id JOIN Payment p
          ON p.reservation_id=r.reservation_id GROUP BY c.guest_id,c.name
-         HAVING total_paid > (SELECT AVG(amount) FROM Payment) ORDER BY total_paid DESC LIMIT 20"""),
-        ("Self/extra join - room types by hotel", """SELECT h.hotel_name,rt.type_name,COUNT(rm.room_id) rooms
-         FROM Hotel h JOIN Room rm ON rm.hotel_id=h.hotel_id JOIN RoomType rt ON rt.type_id=rm.type_id
-         GROUP BY h.hotel_id,rt.type_id ORDER BY h.hotel_name LIMIT 50"""),
+         ) SELECT guest_id,name,total_paid FROM guest_totals
+         WHERE total_paid > (SELECT AVG(total_paid) FROM guest_totals)
+         ORDER BY total_paid DESC LIMIT 20"""),
+        ("Self join - guests from the same city", """SELECT a.name guest_a,b.name guest_b,a.city
+         FROM Guest a JOIN Guest b ON b.city=a.city AND b.guest_id>a.guest_id
+         ORDER BY a.city,a.name,b.name LIMIT 50"""),
     ]
     results = []
     for title, sql in reports_list:
         try:
             results.append((title, sql, query(sql)))
         except Error as exc:
-            results.append((title, sql, [{"error": str(exc)}]))
+            app.logger.exception("Report query failed: %s", title)
+            results.append((title, sql, [{"error": "This report is temporarily unavailable."}]))
     return render_template("reports.html", reports=results)
 
 

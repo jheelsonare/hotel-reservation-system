@@ -43,7 +43,7 @@ CREATE TABLE Room (
   type_id INT NOT NULL,
   room_no VARCHAR(20) NOT NULL,
   capacity TINYINT UNSIGNED NOT NULL,
-  status ENUM('Available', 'Full', 'Maintenance') NOT NULL DEFAULT 'Available',
+  status ENUM('Available', 'Maintenance') NOT NULL DEFAULT 'Available',
   UNIQUE KEY uq_hotel_room (hotel_id, room_no),
   CONSTRAINT fk_room_hotel FOREIGN KEY (hotel_id) REFERENCES Hotel(hotel_id),
   CONSTRAINT fk_room_type FOREIGN KEY (type_id) REFERENCES RoomType(type_id),
