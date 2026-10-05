@@ -243,14 +243,66 @@ def validate(key, values):
 def delete(key, item_id):
     if key in ENTITIES:
         table, pk, _ = ENTITIES[key]
-        try:
+        if key == "guests":
+            conn = cur = None
+            try:
+                conn = connection()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT room_id FROM Reservation WHERE guest_id=%s FOR UPDATE",
+                    (item_id,),
+                )
+                room_ids = sorted({row[0] for row in cur.fetchall()})
+                cur.execute(
+                    """DELETE FROM Payment
+                    WHERE reservation_id IN (
+                        SELECT reservation_id FROM Reservation WHERE guest_id=%s
+                    )""",
+                    (item_id,),
+                )
+                cur.execute("DELETE FROM Reservation WHERE guest_id=%s", (item_id,))
+                if room_ids:
+                    placeholders = ", ".join(["%s"] * len(room_ids))
+                    cur.execute(
+                        f"""UPDATE Room rm
+                        LEFT JOIN (
+                            SELECT room_id, COUNT(*) AS active_count
+                            FROM Reservation
+                            WHERE status IN ('Booked', 'Checked-in')
+                            GROUP BY room_id
+                        ) active ON active.room_id=rm.room_id
+                        SET rm.status=CASE
+                            WHEN COALESCE(active.active_count, 0) >= rm.capacity
+                            THEN 'Full' ELSE 'Available' END
+                        WHERE rm.room_id IN ({placeholders})
+                          AND rm.status <> 'Maintenance'""",
+                        room_ids,
+                    )
+                cur.execute("DELETE FROM Guest WHERE guest_id=%s", (item_id,))
+                if not cur.rowcount:
+                    conn.rollback()
+                    flash("Guest not found.", "error")
+                    return redirect(url_for("listing", key=key))
+                conn.commit()
+            except Error as exc:
+                if conn:
+                    conn.rollback()
+                if getattr(exc, "errno", None) in (1451, 1452):
+                    flash("This guest has related records that could not be deleted.", "error")
+                    return redirect(url_for("listing", key=key))
+                raise
+            finally:
+                if cur:
+                    cur.close()
+                if conn:
+                    conn.close()
+        else:
             execute(f"DELETE FROM `{table}` WHERE `{pk}`=%s", (item_id,))
-        except Error as exc:
-            if getattr(exc, "errno", None) in (1451, 1452):
-                flash("This record is referenced by other records and cannot be deleted.", "error")
-                return redirect(url_for("listing", key=key))
-            raise
-        flash("Record deleted.", "success")
+        flash(
+            "Guest and related reservations and payments deleted."
+            if key == "guests" else "Record deleted.",
+            "success",
+        )
     return redirect(url_for("listing", key=key))
 
 
@@ -261,8 +313,9 @@ def book():
         guest_id = request.form.get("guest_id", type=int)
         new_guest = request.form.get("new_guest") == "1"
         room_type_id = request.form.get("room_type_id", type=int)
-        room_id = None
         check_in, check_out = request.form.get("check_in"), request.form.get("check_out")
+        guest_error = None
+        guest_values = None
         if new_guest:
             guest_values = [
                 request.form.get(field, "").strip() or None
@@ -272,58 +325,58 @@ def book():
             guest_error = validate("guests", guest_values)
             if guest_error:
                 flash(guest_error, "error")
-            else:
-                guest_id = None
         if (not guest_id and not new_guest) or not room_type_id or not check_in or not check_out:
             flash("Enter valid booking details and dates.", "error")
         elif check_in >= check_out:
             flash("Check-out must be after check-in.", "error")
-        elif new_guest and not guest_error:
+        elif not guest_error:
+            conn = cur = None
             try:
-                guest_id = execute(
-                    """INSERT INTO Guest
-                    (name, phone, email, city, state, id_proof_type, id_proof_no)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                    guest_values,
-                )
+                conn = connection()
+                cur = conn.cursor()
+                cur.execute("""SELECT rm.room_id
+                    FROM Room rm
+                    WHERE rm.type_id=%s AND rm.status <> 'Maintenance'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM Reservation r
+                        WHERE r.room_id=rm.room_id
+                          AND r.status IN ('Booked','Checked-in')
+                          AND r.check_in < %s AND r.check_out > %s
+                      )
+                    ORDER BY rm.room_no LIMIT 1 FOR UPDATE""",
+                            (room_type_id, check_out, check_in))
+                room = cur.fetchone()
+                if not room:
+                    conn.rollback()
+                    flash("No room of that type is available for those dates.", "error")
+                else:
+                    room_id = room[0]
+                    if new_guest:
+                        cur.execute(
+                            """INSERT INTO Guest
+                            (name, phone, email, city, state, id_proof_type, id_proof_no)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)""",
+                            guest_values,
+                        )
+                        guest_id = cur.lastrowid
+                    cur.callproc("book_room", (guest_id, room_id, check_in, check_out))
+                    conn.commit()
+                    flash("Reservation booked successfully.", "success")
+                    return redirect(url_for("listing", key="reservations"))
             except Error as exc:
+                if conn:
+                    conn.rollback()
+                app.logger.exception("Reservation booking failed")
                 if getattr(exc, "errno", None) == 1062:
                     flash("A guest with that phone number or email already exists.", "error")
                 else:
-                    raise
-        if guest_id and room_type_id and check_in and check_out:
-            room = query("""SELECT rm.room_id
-                FROM Room rm
-                WHERE rm.type_id=%s
-                  AND NOT EXISTS (
-                    SELECT 1 FROM Reservation r
-                    WHERE r.room_id=rm.room_id
-                      AND r.status NOT IN ('Cancelled','Completed')
-                      AND r.check_in < %s AND r.check_out > %s
-                  )
-                ORDER BY rm.room_no LIMIT 1""",
-                         (room_type_id, check_out, check_in), one=True)
-            room_id = room["room_id"] if room else None
-            if not room_id:
-                flash("No room of that type is available for those dates.", "error")
-        if guest_id and room_id and check_in and check_out:
-            overlap = query("""SELECT reservation_id FROM Reservation
-                WHERE room_id=%s AND status NOT IN ('Cancelled','Completed')
-                AND check_in < %s AND check_out > %s LIMIT 1""",
-                            (room_id, check_out, check_in), one=True)
-            if overlap:
-                flash("Room is already reserved for those dates.", "error")
-            else:
-                try:
-                    conn = connection()
-                    cur = conn.cursor()
-                    cur.callproc("book_room", (guest_id, room_id, check_in, check_out))
-                    conn.commit()
-                    cur.close(); conn.close()
-                    flash("Reservation booked using stored procedure.", "success")
-                    return redirect(url_for("listing", key="reservations"))
-                except Error as exc:
                     flash("Booking failed: " + str(exc), "error")
+            finally:
+                if cur:
+                    cur.close()
+                if conn:
+                    conn.close()
+            return redirect(url_for("book"))
     guests = query("SELECT guest_id,name FROM Guest ORDER BY name LIMIT 1000")
     room_types = query("SELECT type_id, type_name, rent_per_day FROM RoomType ORDER BY rent_per_day")
     return render_template("reservation_form.html", guests=guests, room_types=room_types)
