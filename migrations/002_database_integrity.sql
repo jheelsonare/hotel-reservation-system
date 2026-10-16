@@ -29,4 +29,3 @@ ALTER TABLE Reservation
 ALTER TABLE Payment
   ADD CONSTRAINT ck_payment_date CHECK (payment_date >= '1000-01-01' AND MONTH(payment_date) > 0 AND DAYOFMONTH(payment_date) > 0 AND DAYOFMONTH(payment_date) <= DAYOFMONTH(LAST_DAY(payment_date))),
   ADD CONSTRAINT ck_payment_mode CHECK (mode IN ('Cash','UPI','Card','Net Banking'));
-
