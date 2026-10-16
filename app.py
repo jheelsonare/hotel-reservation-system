@@ -3,22 +3,89 @@ import os
 import secrets
 import hmac
 from datetime import date, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from functools import wraps
+from collections import OrderedDict, deque
+from threading import Lock
+from time import monotonic
 from urllib.parse import urlencode
 
 import mysql.connector
 from dotenv import load_dotenv
-from flask import Flask, flash, redirect, render_template, request, session, url_for
+from flask import Flask, Response, flash, redirect, render_template, request, session, url_for
+from werkzeug.security import check_password_hash
 from mysql.connector import Error
 
 load_dotenv()
 app = Flask(__name__)
-app.secret_key = os.getenv("SECRET_KEY", "change-this-secret")
+# A missing key gets a cryptographically random per-process key, never a known fallback.
+configured_secret = os.getenv("SECRET_KEY", "")
+if configured_secret and (len(configured_secret) < 32 or configured_secret in (
+    "change-this-secret", "replace-with-a-random-secret",
+)):
+    raise RuntimeError("SECRET_KEY must be a new random value of at least 32 characters")
+app.secret_key = configured_secret or secrets.token_hex(32)
+app.config.update(
+    ADMIN_USERNAME=os.getenv("ADMIN_USERNAME", "admin"),
+    ADMIN_PASSWORD_HASH=os.getenv("ADMIN_PASSWORD_HASH", ""),
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=os.getenv("SESSION_COOKIE_SECURE", "0") == "1",
+    MAX_CONTENT_LENGTH=64 * 1024,
+)
+_auth_failures = OrderedDict()
+_auth_lock = Lock()
+
+
+@app.before_request
+def require_admin():
+    """Protect every database-facing route; missing configuration fails closed."""
+    password_hash = app.config.get("ADMIN_PASSWORD_HASH", "")
+    if not password_hash:
+        return Response("Administrator access is not configured. Set ADMIN_PASSWORD_HASH.", status=503)
+    auth = request.authorization
+    if not auth or auth.type.lower() != "basic":
+        return Response("Sign in to manage hotel records.", status=401,
+                        headers={"WWW-Authenticate": 'Basic realm="Hotel administration", charset="UTF-8"'})
+    address, now = request.remote_addr or "unknown", monotonic()
+    with _auth_lock:
+        failures = _auth_failures.setdefault(address, deque())
+        while failures and failures[0] <= now - 60:
+            failures.popleft()
+        if len(failures) >= 5:
+            return Response("Too many sign-in attempts. Try again in one minute.", status=429,
+                            headers={"Retry-After": "60"})
+    try:
+        valid = (hmac.compare_digest((auth.username or "").encode(),
+                                     app.config["ADMIN_USERNAME"].encode())
+                 and check_password_hash(password_hash, auth.password or ""))
+    except (ValueError, TypeError):
+        return Response("Administrator password hash is invalid.", status=503)
+    with _auth_lock:
+        if valid:
+            _auth_failures.pop(address, None)
+        else:
+            _auth_failures.setdefault(address, deque()).append(now)
+            _auth_failures.move_to_end(address)
+            while len(_auth_failures) > 1024:
+                _auth_failures.popitem(last=False)
+    if not valid:
+        return Response("Invalid sign-in details.", status=401,
+                        headers={"WWW-Authenticate": 'Basic realm="Hotel administration", charset="UTF-8"'})
+
+
+@app.after_request
+def protect_response(response):
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
+
+
 DB_CONFIG = {
     "host": os.getenv("DB_HOST", "127.0.0.1"),
     "port": int(os.getenv("DB_PORT", "3306")),
-    "user": os.getenv("DB_USER", "root"),
+    "user": os.getenv("DB_USER", "hotel_app"),
     "password": os.getenv("DB_PASSWORD", ""),
     "database": os.getenv("DB_NAME", "hotel_db"),
 }
@@ -38,7 +105,18 @@ FIELD_CHOICES = {
 
 
 def connection():
-    return mysql.connector.connect(**DB_CONFIG)
+    conn = mysql.connector.connect(
+        **DB_CONFIG, connection_timeout=5, autocommit=False, charset="utf8mb4",
+        sql_mode="STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION",
+    )
+    try:
+        cur = conn.cursor()
+        cur.execute("SET SESSION max_execution_time=5000, innodb_lock_wait_timeout=5")
+        cur.close()
+        return conn
+    except Error:
+        conn.close()
+        raise
 
 
 def query(sql, params=(), one=False, dictionary=True):
@@ -64,6 +142,10 @@ def execute(sql, params=()):
         cur.execute(sql, params)
         conn.commit()
         return cur.lastrowid
+    except Error:
+        if conn:
+            conn.rollback()
+        raise
     finally:
         if cur:
             cur.close()
@@ -121,7 +203,7 @@ def safe_db(fn):
         try:
             return fn(*args, **kwargs)
         except Error as exc:
-            app.logger.exception("Database operation failed")
+            app.logger.warning("Database operation failed (errno=%s)", exc.errno)
             flash("The database could not complete that operation. Please check the values and try again.", "error")
             return redirect(url_for("dashboard"))
     return wrapped
@@ -216,7 +298,7 @@ def dashboard():
 def page_data(key):
     table, pk, fields = ENTITIES[key]
     page = max(request.args.get("page", 1, type=int), 1)
-    search = request.args.get("q", "").strip()
+    search = request.args.get("q", "").strip()[:200]
     sort = request.args.get("sort", pk)
     if sort not in fields + [pk]:
         sort = pk
@@ -291,16 +373,20 @@ def edit(key, item_id=None):
             flash("Your form expired. Please try again.", "error")
             return redirect(request.url)
         values = [request.form.get(field, "").strip() or None for field in fields]
-        error = validate(key, values)
+        error = validate(key, values, existing=record)
         if error:
             flash(error, "error")
         else:
             if key == "guests":
                 save_guest(values, item_id)
             elif item_id:
+                if key == "payments":
+                    values[1] = format(Decimal(values[1]), ".2f")
                 execute(f"UPDATE `{table}` SET " + ", ".join(f"`{f}`=%s" for f in fields) +
                         f" WHERE `{pk}`=%s", values + [item_id])
             else:
+                if key == "payments":
+                    values[1] = format(Decimal(values[1]), ".2f")
                 execute(f"INSERT INTO `{table}` (" + ",".join(f"`{f}`" for f in fields) +
                         ") VALUES (" + ",".join(["%s"] * len(fields)) + ")", values)
             flash(f"{table} saved.", "success")
@@ -319,29 +405,60 @@ def edit(key, item_id=None):
                            field_choices=FIELD_CHOICES, foreign_options=foreign_options)
 
 
-def validate(key, values):
+def parse_form_date(value):
+    parsed = date.fromisoformat(value or "")
+    if parsed.year < 1000 or parsed.isoformat() != value:
+        raise ValueError("Use YYYY-MM-DD dates")
+    return parsed
+
+
+def validate(key, values, existing=None):
     import re
-    if key == "guests" and (not values[0] or not values[1]):
-        return "Guest name and phone are required."
-    if key == "guests" and (not values[3] or not values[4]):
-        return "Guest city and state are required."
-    if key == "guests" and not re.fullmatch(r"[6-9]\d{9}", str(values[1])):
-        return "Phone must be a 10-digit Indian mobile number starting with 6-9."
-    if key == "guests" and values[2] and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", str(values[2])):
-        return "Enter a valid email address."
+    fields = ENTITIES[key][2]
+    data = dict(zip(fields, values))
+    limits = {"name": 120, "phone": 10, "email": 160, "city": 80, "state": 80,
+              "id_proof_type": 40, "id_proof_no": 40, "hotel_name": 120,
+              "address": 255, "manager_name": 120, "room_no": 20}
+    for field, value in data.items():
+        if value is None and field != "email":
+            return f"{field.replace('_', ' ').title()} is required."
+        if field in limits and value is not None and len(value) > limits[field]:
+            return f"{field.replace('_', ' ').title()} is too long."
+        if field.endswith("_id") or field == "capacity":
+            digits = str(value or "")
+            max_digits, maximum = (3, 255) if field == "capacity" else (10, 2147483647)
+            if (len(digits) > max_digits or not re.fullmatch(r"[0-9]+", digits)
+                    or not 1 <= int(digits) <= maximum):
+                return f"Enter a valid positive {field.replace('_', ' ')}."
+    if key == "guests":
+        if not re.fullmatch(r"[6-9][0-9]{9}", str(data["phone"])):
+            return "Phone must be a 10-digit Indian mobile number starting with 6-9."
+        if data["email"] and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", data["email"]):
+            return "Enter a valid email address."
+    for (entity, field), choices in FIELD_CHOICES.items():
+        if entity == key and data[field] not in choices:
+            return f"Choose a valid {field.replace('_', ' ')}."
     if key == "reservations":
-        if not values[0] or not values[1] or not values[2] or not values[3]:
-            return "Guest, room, check-in and check-out are required."
-        if str(values[2]) >= str(values[3]):
+        try:
+            check_in, check_out = parse_form_date(data["check_in"]), parse_form_date(data["check_out"])
+        except (ValueError, TypeError):
+            return "Enter valid check-in and check-out dates (YYYY-MM-DD)."
+        if check_in >= check_out:
             return "Check-out must be after check-in."
-        if values[4] in ("Booked", "Checked-in") and str(values[2]) < date.today().isoformat():
+        unchanged_start = existing and str(existing.get("check_in")) == data["check_in"]
+        if data["status"] in ("Booked", "Checked-in") and check_in < date.today() and not unchanged_start:
             return "Active reservations cannot start in the past."
-        if values[4] not in FIELD_CHOICES[("reservations", "status")]:
-            return "Choose a valid reservation status."
-    if key == "rooms" and values[4] not in FIELD_CHOICES[("rooms", "status")]:
-        return "Choose Available or Maintenance for room status."
-    if key == "payments" and values[3] not in FIELD_CHOICES[("payments", "mode")]:
-        return "Choose a valid payment mode."
+    if key == "payments":
+        try:
+            amount = Decimal(data["amount"])
+            if not amount.is_finite() or amount < 0 or amount > Decimal("99999999.99") or amount != amount.quantize(Decimal("0.01")):
+                raise ValueError
+        except (InvalidOperation, ValueError, TypeError):
+            return "Amount must be between 0 and 99999999.99 with at most two decimal places."
+        try:
+            parse_form_date(data["payment_date"])
+        except (ValueError, TypeError):
+            return "Enter a valid payment date (YYYY-MM-DD)."
     return None
 
 
@@ -375,6 +492,12 @@ def book():
         new_guest = request.form.get("new_guest") == "1"
         room_type_id = request.form.get("room_type_id", type=int)
         check_in, check_out = request.form.get("check_in"), request.form.get("check_out")
+        date_error = None
+        try:
+            parse_form_date(check_in)
+            parse_form_date(check_out)
+        except (ValueError, TypeError):
+            date_error = "Enter valid check-in and check-out dates (YYYY-MM-DD)."
         guest_error = None
         guest_values = None
         if new_guest:
@@ -388,6 +511,8 @@ def book():
                 flash(guest_error, "error")
         if (not guest_id and not new_guest) or not room_type_id or not check_in or not check_out:
             flash("Enter valid booking details and dates.", "error")
+        elif date_error:
+            flash(date_error, "error")
         elif check_in < date.today().isoformat():
             flash("Check-in cannot be in the past.", "error")
         elif check_in >= check_out:
@@ -423,7 +548,7 @@ def book():
             except Error as exc:
                 if conn:
                     conn.rollback()
-                app.logger.exception("Reservation booking failed")
+                app.logger.warning("Reservation booking failed (errno=%s)", exc.errno)
                 if getattr(exc, "errno", None) == 1062:
                     flash("A guest with that phone number or email already exists.", "error")
                 else:
@@ -481,7 +606,7 @@ def reports():
         try:
             results.append((title, sql, query(sql)))
         except Error as exc:
-            app.logger.exception("Report query failed: %s", title)
+            app.logger.warning("Report query failed: %s (errno=%s)", title, exc.errno)
             results.append((title, sql, [{"error": "This report is temporarily unavailable."}]))
     return render_template("reports.html", reports=results)
 

@@ -1,12 +1,12 @@
 USE hotel_db;
 
-CREATE OR REPLACE VIEW guest_details_view AS
+CREATE OR REPLACE SQL SECURITY INVOKER VIEW guest_details_view AS
 SELECT g.guest_id, g.name, g.phone, g.email, l.city, l.state,
        g.id_proof_type, g.id_proof_no
 FROM Guest g JOIN Location l ON l.location_id = g.location_id;
 
 DROP VIEW IF EXISTS available_rooms_view;
-CREATE VIEW available_rooms_view AS
+CREATE SQL SECURITY INVOKER VIEW available_rooms_view AS
 SELECT rm.room_id, h.hotel_name, h.city, rm.room_no, rm.capacity,
        rt.type_name, rt.rent_per_day
 FROM Room rm
@@ -24,15 +24,20 @@ WHERE rm.status = 'Available'
 
 DROP TRIGGER IF EXISTS trg_res_no_overlap_ins;
 DROP TRIGGER IF EXISTS trg_res_no_overlap_upd;
+DROP TRIGGER IF EXISTS trg_room_maintenance_upd;
 DROP PROCEDURE IF EXISTS book_room;
 DELIMITER //
 CREATE TRIGGER trg_res_no_overlap_ins
 BEFORE INSERT ON Reservation
 FOR EACH ROW
 BEGIN
-  IF NEW.status IN ('Booked','Checked-in') AND EXISTS (
-    SELECT 1 FROM Room WHERE room_id = NEW.room_id AND status = 'Maintenance'
-  ) THEN
+  DECLARE locked_status VARCHAR(20) DEFAULT NULL;
+  -- All booking paths serialize on the same parent row until commit/rollback.
+  SELECT status INTO locked_status FROM Room WHERE room_id=NEW.room_id FOR UPDATE;
+  IF locked_status IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Room does not exist';
+  END IF;
+  IF NEW.status IN ('Booked','Checked-in') AND locked_status = 'Maintenance' THEN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Room is under maintenance';
   END IF;
   IF NEW.status IN ('Booked','Checked-in') AND EXISTS (
@@ -47,9 +52,13 @@ CREATE TRIGGER trg_res_no_overlap_upd
 BEFORE UPDATE ON Reservation
 FOR EACH ROW
 BEGIN
-  IF NEW.status IN ('Booked','Checked-in') AND EXISTS (
-    SELECT 1 FROM Room WHERE room_id = NEW.room_id AND status = 'Maintenance'
-  ) THEN
+  DECLARE locked_status VARCHAR(20) DEFAULT NULL;
+  -- All booking paths serialize on the same parent row until commit/rollback.
+  SELECT status INTO locked_status FROM Room WHERE room_id=NEW.room_id FOR UPDATE;
+  IF locked_status IS NULL THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Room does not exist';
+  END IF;
+  IF NEW.status IN ('Booked','Checked-in') AND locked_status = 'Maintenance' THEN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Room is under maintenance';
   END IF;
   IF NEW.status IN ('Booked','Checked-in') AND EXISTS (
@@ -61,8 +70,22 @@ BEGIN
     SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Room is already reserved for these dates';
   END IF;
 END//
+CREATE TRIGGER trg_room_maintenance_upd
+BEFORE UPDATE ON Room
+FOR EACH ROW
+BEGIN
+  IF NEW.status = 'Maintenance' AND OLD.status <> 'Maintenance' AND EXISTS (
+    SELECT 1 FROM Reservation
+    WHERE room_id=OLD.room_id AND status IN ('Booked','Checked-in')
+      AND check_out > CURDATE()
+  ) THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Move or cancel active reservations before maintenance';
+  END IF;
+END//
 CREATE PROCEDURE book_room(IN p_guest_id INT, IN p_room_id INT,
                            IN p_check_in DATE, IN p_check_out DATE)
+SQL SECURITY INVOKER
 BEGIN
   DECLARE room_status VARCHAR(20);
   SELECT status INTO room_status FROM Room WHERE room_id = p_room_id FOR UPDATE;

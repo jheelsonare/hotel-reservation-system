@@ -1,5 +1,6 @@
 """Real-MySQL integration tests; only randomly named temporary databases are used."""
 import os
+import base64
 from pathlib import Path
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from datetime import date, timedelta
 
 import mysql.connector
 from mysql.connector import Error
+from werkzeug.security import generate_password_hash
 import app as hotel
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,10 +52,23 @@ def run_script(conn, text, database):
         cur.close()
 
 
-class BCNFIntegrationTests(unittest.TestCase):
+TEST_USERNAME, TEST_PASSWORD = "test-admin", "integration-only-password"
+
+
+def authenticated_client():
+    client = hotel.app.test_client()
+    encoded = base64.b64encode(f"{TEST_USERNAME}:{TEST_PASSWORD}".encode()).decode()
+    client.environ_base["HTTP_AUTHORIZATION"] = "Basic " + encoded
+    return client
+
+
+class MySQLTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.original_config = hotel.DB_CONFIG.copy()
+        cls.original_auth = (hotel.app.config["ADMIN_USERNAME"], hotel.app.config["ADMIN_PASSWORD_HASH"])
+        hotel.app.config.update(ADMIN_USERNAME=TEST_USERNAME,
+            ADMIN_PASSWORD_HASH=generate_password_hash(TEST_PASSWORD, method="pbkdf2:sha256:1000"))
         cls.db = 'hotel_test_' + uuid.uuid4().hex[:16]
         cls.conn = mysql.connector.connect(**CONFIG)
         try:
@@ -72,6 +87,7 @@ class BCNFIntegrationTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         hotel.DB_CONFIG = cls.original_config
+        hotel.app.config.update(ADMIN_USERNAME=cls.original_auth[0], ADMIN_PASSWORD_HASH=cls.original_auth[1])
         cur = cls.conn.cursor()
         cur.execute(f'DROP DATABASE `{cls.db}`')
         cur.close()
@@ -80,6 +96,8 @@ class BCNFIntegrationTests(unittest.TestCase):
     def query(self, sql, params=()):
         return hotel.query(sql, params)
 
+
+class BCNFIntegrationTests(MySQLTestCase):
     def test_seed_and_location_foreign_key(self):
         self.assertEqual(self.query('SELECT COUNT(*) n FROM Guest')[0]['n'], 1200)
         self.assertEqual(self.query('SELECT COUNT(*) n FROM guest_details_view')[0]['n'], 1200)
@@ -110,7 +128,7 @@ class BCNFIntegrationTests(unittest.TestCase):
         self.assertEqual(self.query("SELECT COUNT(*) n FROM Location WHERE city='Rollback City'")[0]['n'], 0)
 
     def test_guest_forms_search_sort_and_delete(self):
-        client = hotel.app.test_client()
+        client = authenticated_client()
         self.assertEqual(client.get('/guests/new').status_code, 200)
         with client.session_transaction() as session:
             token = session['csrf_token']
@@ -130,7 +148,7 @@ class BCNFIntegrationTests(unittest.TestCase):
         hotel.execute("DELETE FROM Location WHERE city='Form City'")
 
     def test_all_pages_and_report_sql(self):
-        client = hotel.app.test_client()
+        client = authenticated_client()
         for route in ['/', '/guests', '/hotels', '/rooms', '/reservations', '/payments',
                       '/reservations/book', '/reports']:
             response = client.get(route)
@@ -142,7 +160,7 @@ class BCNFIntegrationTests(unittest.TestCase):
         self.assertIn(b'guest_details_view', response.data)
 
     def test_new_guest_booking_and_overlap_guard(self):
-        client = hotel.app.test_client()
+        client = authenticated_client()
         client.get('/reservations/book')
         with client.session_transaction() as session:
             token = session['csrf_token']
@@ -205,6 +223,7 @@ CREATE INDEX idx_guest_city ON Guest(city);
                 cur.execute(f'SELECT * FROM {table} ORDER BY 1')
                 snapshots[table] = cur.fetchall()
             run_script(conn, (ROOT/'migrations/001_guest_locations.sql').read_text(), database)
+            run_script(conn, (ROOT/'migrations/002_database_integrity.sql').read_text(), database)
             run_script(conn, (ROOT/'advanced.sql').read_text(), database)
             for table, expected in snapshots.items():
                 source = 'guest_details_view' if table == 'Guest' else table

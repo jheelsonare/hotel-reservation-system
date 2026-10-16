@@ -7,3 +7,7 @@ __pycache__/
 !.env.example
 .vscode/
 *.log
+backups/
+hotel_db_before_*.sql
+*_backup.sql
+*.sql.gz
