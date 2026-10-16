@@ -80,6 +80,13 @@ for h in range(1, len(hotels) + 1):
 out.append("INSERT INTO Room (hotel_id, type_id, room_no, capacity, status) VALUES")
 out.append(",\n".join(f"({h}, {t}, '{no}', {cap}, 'Available')" for _, h, t, no, cap in rooms) + ";\n")
 
+# Locations: a city name may occur in more than one state.
+location_ids = {place: i for i, place in enumerate(places, 1)}
+out.append("INSERT INTO Location (location_id, city, state) VALUES")
+out.append(",\n".join(
+    f"({i}, '{esc(c)}', '{esc(st)}')" for (c, st), i in location_ids.items()
+) + ";\n")
+
 # Guests
 used_emails, used_phones = set(), set()
 guests = []
@@ -99,8 +106,8 @@ for i in range(1, NUM_GUESTS + 1):
     idno = f"XXXX-XXXX-{random.randint(1000, 9999)}"
     guests.append((name, phone, email, city, state, idt, idno))
 
-out.append("INSERT INTO Guest (name, phone, email, city, state, id_proof_type, id_proof_no) VALUES")
-rows = [f"('{esc(n)}', '{p}', '{e}', '{c}', '{s}', '{t}', '{no}')" for n, p, e, c, s, t, no in guests]
+out.append("INSERT INTO Guest (name, phone, email, location_id, id_proof_type, id_proof_no) VALUES")
+rows = [f"('{esc(n)}', '{p}', '{e}', {location_ids[(c, s)]}, '{t}', '{no}')" for n, p, e, c, s, t, no in guests]
 out.append(",\n".join(rows) + ";\n")
 
 # Reservations + payments

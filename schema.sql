@@ -2,12 +2,14 @@ CREATE DATABASE IF NOT EXISTS hotel_db
   CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 USE hotel_db;
 
+DROP VIEW IF EXISTS guest_details_view;
 SET FOREIGN_KEY_CHECKS = 0;
 DROP TABLE IF EXISTS Payment;
 DROP TABLE IF EXISTS Reservation;
 DROP TABLE IF EXISTS Room;
 DROP TABLE IF EXISTS RoomType;
 DROP TABLE IF EXISTS Guest;
+DROP TABLE IF EXISTS Location;
 DROP TABLE IF EXISTS Hotel;
 SET FOREIGN_KEY_CHECKS = 1;
 
@@ -19,15 +21,22 @@ CREATE TABLE Hotel (
   manager_name VARCHAR(120) NOT NULL
 ) ENGINE=InnoDB;
 
+CREATE TABLE Location (
+  location_id INT AUTO_INCREMENT PRIMARY KEY,
+  city VARCHAR(80) NOT NULL,
+  state VARCHAR(80) NOT NULL,
+  UNIQUE KEY uq_location_city_state (city, state)
+) ENGINE=InnoDB;
+
 CREATE TABLE Guest (
   guest_id INT AUTO_INCREMENT PRIMARY KEY,
   name VARCHAR(120) NOT NULL,
   phone CHAR(10) NOT NULL UNIQUE,
   email VARCHAR(160) UNIQUE,
-  city VARCHAR(80) NOT NULL,
-  state VARCHAR(80) NOT NULL,
+  location_id INT NOT NULL,
   id_proof_type VARCHAR(40) NOT NULL,
-  id_proof_no VARCHAR(40) NOT NULL
+  id_proof_no VARCHAR(40) NOT NULL,
+  CONSTRAINT fk_guest_location FOREIGN KEY (location_id) REFERENCES Location(location_id)
 ) ENGINE=InnoDB;
 
 CREATE TABLE RoomType (

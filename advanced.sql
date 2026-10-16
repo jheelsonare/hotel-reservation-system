@@ -1,5 +1,10 @@
 USE hotel_db;
 
+CREATE OR REPLACE VIEW guest_details_view AS
+SELECT g.guest_id, g.name, g.phone, g.email, l.city, l.state,
+       g.id_proof_type, g.id_proof_no
+FROM Guest g JOIN Location l ON l.location_id = g.location_id;
+
 DROP VIEW IF EXISTS available_rooms_view;
 CREATE VIEW available_rooms_view AS
 SELECT rm.room_id, h.hotel_name, h.city, rm.room_no, rm.capacity,
@@ -82,13 +87,6 @@ BEGIN
 END//
 DELIMITER ;
 
-SET @sql = IF(
-  EXISTS (SELECT 1 FROM information_schema.statistics
-          WHERE table_schema=DATABASE() AND table_name='Guest' AND index_name='idx_guest_city'),
-  'SELECT 1',
-  'CREATE INDEX idx_guest_city ON Guest(city)'
-);
-PREPARE stmt FROM @sql; EXECUTE stmt; DEALLOCATE PREPARE stmt;
 SET @sql = IF(
   EXISTS (SELECT 1 FROM information_schema.statistics
           WHERE table_schema=DATABASE() AND table_name='Reservation' AND index_name='idx_reservation_status'),

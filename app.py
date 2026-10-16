@@ -71,6 +71,50 @@ def execute(sql, params=()):
             conn.close()
 
 
+def write_guest(cur, values, item_id=None):
+    """Resolve a city/state pair and write its FK in the caller's transaction."""
+    name, phone, email, city, state, proof_type, proof_no = values
+    cur.execute(
+        """INSERT INTO Location (city, state) VALUES (%s, %s)
+        ON DUPLICATE KEY UPDATE location_id=LAST_INSERT_ID(location_id)""",
+        (city, state),
+    )
+    location_id = cur.lastrowid
+    guest_values = (name, phone, email, location_id, proof_type, proof_no)
+    if item_id is None:
+        cur.execute(
+            """INSERT INTO Guest
+            (name, phone, email, location_id, id_proof_type, id_proof_no)
+            VALUES (%s, %s, %s, %s, %s, %s)""", guest_values,
+        )
+        return cur.lastrowid
+    cur.execute(
+        """UPDATE Guest SET name=%s, phone=%s, email=%s, location_id=%s,
+        id_proof_type=%s, id_proof_no=%s WHERE guest_id=%s""",
+        guest_values + (item_id,),
+    )
+    return item_id
+
+
+def save_guest(values, item_id=None):
+    conn = cur = None
+    try:
+        conn = connection()
+        cur = conn.cursor()
+        guest_id = write_guest(cur, values, item_id)
+        conn.commit()
+        return guest_id
+    except Error:
+        if conn:
+            conn.rollback()
+        raise
+    finally:
+        if cur:
+            cur.close()
+        if conn:
+            conn.close()
+
+
 def safe_db(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
@@ -137,7 +181,7 @@ def dashboard():
     counts = {"guests": 0, "rooms": 0, "available_rooms": 0,
               "active_reservations": 0, "revenue": 0}
     try:
-        counts["guests"] = query("SELECT COUNT(*) n FROM Guest", one=True)["n"]
+        counts["guests"] = query("SELECT COUNT(*) n FROM guest_details_view", one=True)["n"]
         counts["rooms"] = query("SELECT COUNT(*) n FROM Room", one=True)["n"]
         counts["available_rooms"] = query("SELECT COUNT(*) n FROM available_rooms_view", one=True)["n"]
         counts["active_reservations"] = query(
@@ -150,7 +194,7 @@ def dashboard():
     try:
         upcoming = query("""SELECT r.reservation_id, c.name, h.hotel_name, rm.room_no,
             r.check_in, r.check_out, r.status
-            FROM Reservation r JOIN Guest c ON c.guest_id=r.guest_id
+            FROM Reservation r JOIN guest_details_view c ON c.guest_id=r.guest_id
             JOIN Room rm ON rm.room_id=r.room_id JOIN Hotel h ON h.hotel_id=rm.hotel_id
             WHERE r.check_out >= CURDATE() AND r.status <> 'Cancelled'
             ORDER BY r.check_in LIMIT 8""")
@@ -177,7 +221,7 @@ def page_data(key):
     if sort not in fields + [pk]:
         sort = pk
     where, params = "", []
-    from_sql = f"`{table}`"
+    from_sql = "guest_details_view" if key == "guests" else f"`{table}`"
     alias = ""
     if key == "reservations":
         from_sql = "Reservation r JOIN Room rm ON rm.room_id=r.room_id"
@@ -237,7 +281,8 @@ def edit(key, item_id=None):
     if key not in ENTITIES:
         return redirect(url_for("dashboard"))
     table, pk, fields = ENTITIES[key]
-    record = query(f"SELECT * FROM `{table}` WHERE `{pk}`=%s", (item_id,), one=True) if item_id else {}
+    read_table = "guest_details_view" if key == "guests" else table
+    record = query(f"SELECT * FROM `{read_table}` WHERE `{pk}`=%s", (item_id,), one=True) if item_id else {}
     if item_id and not record:
         flash(f"{table} not found.", "error")
         return redirect(url_for("listing", key=key))
@@ -250,7 +295,9 @@ def edit(key, item_id=None):
         if error:
             flash(error, "error")
         else:
-            if item_id:
+            if key == "guests":
+                save_guest(values, item_id)
+            elif item_id:
                 execute(f"UPDATE `{table}` SET " + ", ".join(f"`{f}`=%s" for f in fields) +
                         f" WHERE `{pk}`=%s", values + [item_id])
             else:
@@ -263,7 +310,7 @@ def edit(key, item_id=None):
         foreign_options[("rooms", "hotel_id")] = query("SELECT hotel_id id, hotel_name label FROM Hotel ORDER BY hotel_name")
         foreign_options[("rooms", "type_id")] = query("SELECT type_id id, type_name label FROM RoomType ORDER BY type_name")
     elif key == "reservations":
-        foreign_options[("reservations", "guest_id")] = query("SELECT guest_id id, CONCAT(name, ' (#', guest_id, ')') label FROM Guest ORDER BY name, guest_id")
+        foreign_options[("reservations", "guest_id")] = query("SELECT guest_id id, CONCAT(name, ' (#', guest_id, ')') label FROM guest_details_view ORDER BY name, guest_id")
         foreign_options[("reservations", "room_id")] = query("SELECT room_id id, CONCAT(room_no, ' (#', room_id, ')') label FROM Room ORDER BY CAST(room_no AS UNSIGNED), room_id")
     elif key == "payments":
         foreign_options[("payments", "reservation_id")] = query("SELECT reservation_id id, CONCAT('#', reservation_id, ' ', check_in, ' to ', check_out) label FROM Reservation ORDER BY check_in DESC, reservation_id DESC")
@@ -276,6 +323,8 @@ def validate(key, values):
     import re
     if key == "guests" and (not values[0] or not values[1]):
         return "Guest name and phone are required."
+    if key == "guests" and (not values[3] or not values[4]):
+        return "Guest city and state are required."
     if key == "guests" and not re.fullmatch(r"[6-9]\d{9}", str(values[1])):
         return "Phone must be a 10-digit Indian mobile number starting with 6-9."
     if key == "guests" and values[2] and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", str(values[2])):
@@ -366,13 +415,7 @@ def book():
                 else:
                     room_id = room[0]
                     if new_guest:
-                        cur.execute(
-                            """INSERT INTO Guest
-                            (name, phone, email, city, state, id_proof_type, id_proof_no)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)""",
-                            guest_values,
-                        )
-                        guest_id = cur.lastrowid
+                        guest_id = write_guest(cur, guest_values)
                     cur.callproc("book_room", (guest_id, room_id, check_in, check_out))
                     conn.commit()
                     flash("Reservation booked successfully.", "success")
@@ -391,7 +434,7 @@ def book():
                 if conn:
                     conn.close()
             return redirect(url_for("book"))
-    guests = query("SELECT guest_id,name FROM Guest ORDER BY name, guest_id")
+    guests = query("SELECT guest_id,name FROM guest_details_view ORDER BY name, guest_id")
     room_types = query("SELECT type_id, type_name, rent_per_day FROM RoomType ORDER BY rent_per_day")
     return render_template("reservation_form.html", guests=guests, room_types=room_types)
 
@@ -402,17 +445,17 @@ def reports():
     reports_list = [
         ("Booking details", """SELECT r.reservation_id,c.name,rm.room_no,h.hotel_name,
          rt.type_name,r.check_in,r.check_out,r.status FROM Reservation r
-         INNER JOIN Guest c ON c.guest_id=r.guest_id INNER JOIN Room rm ON rm.room_id=r.room_id
+         INNER JOIN guest_details_view c ON c.guest_id=r.guest_id INNER JOIN Room rm ON rm.room_id=r.room_id
          INNER JOIN Hotel h ON h.hotel_id=rm.hotel_id INNER JOIN RoomType rt ON rt.type_id=rm.type_id
          ORDER BY r.check_in DESC LIMIT 50"""),
         ("LEFT JOIN - guests who never booked", """SELECT c.guest_id,c.name,c.city
-         FROM Guest c LEFT JOIN Reservation r ON r.guest_id=c.guest_id
+         FROM guest_details_view c LEFT JOIN Reservation r ON r.guest_id=c.guest_id
          WHERE r.reservation_id IS NULL ORDER BY c.name LIMIT 50"""),
         ("RIGHT JOIN - rooms never booked", """SELECT rm.room_id,rm.room_no,h.hotel_name
          FROM Reservation r RIGHT JOIN Room rm ON rm.room_id=r.room_id
          JOIN Hotel h ON h.hotel_id=rm.hotel_id WHERE r.reservation_id IS NULL LIMIT 50"""),
         ("Aggregate + JOIN - payment per guest", """SELECT c.guest_id,c.name,SUM(p.amount) total_paid
-         FROM Guest c JOIN Reservation r ON r.guest_id=c.guest_id JOIN Payment p
+         FROM guest_details_view c JOIN Reservation r ON r.guest_id=c.guest_id JOIN Payment p
          ON p.reservation_id=r.reservation_id GROUP BY c.guest_id,c.name
          ORDER BY total_paid DESC LIMIT 20"""),
         ("Aggregate - revenue by hotel", """SELECT h.hotel_name,SUM(p.amount) revenue
@@ -420,17 +463,17 @@ def reports():
          JOIN Payment p ON p.reservation_id=r.reservation_id GROUP BY h.hotel_id,h.hotel_name
          ORDER BY revenue DESC LIMIT 20"""),
         ("Aggregate - bookings by city/state", """SELECT c.city,c.state,COUNT(*) bookings
-         FROM Guest c JOIN Reservation r ON r.guest_id=c.guest_id
+         FROM guest_details_view c JOIN Reservation r ON r.guest_id=c.guest_id
          GROUP BY c.city,c.state HAVING COUNT(*) > 1 ORDER BY bookings DESC LIMIT 50"""),
         ("Subquery - guests paying above average", """WITH guest_totals AS (
          SELECT c.guest_id,c.name,SUM(p.amount) total_paid
-         FROM Guest c JOIN Reservation r ON r.guest_id=c.guest_id JOIN Payment p
+         FROM guest_details_view c JOIN Reservation r ON r.guest_id=c.guest_id JOIN Payment p
          ON p.reservation_id=r.reservation_id GROUP BY c.guest_id,c.name
          ) SELECT guest_id,name,total_paid FROM guest_totals
          WHERE total_paid > (SELECT AVG(total_paid) FROM guest_totals)
          ORDER BY total_paid DESC LIMIT 20"""),
         ("Self join - guests from the same city", """SELECT a.name guest_a,b.name guest_b,a.city
-         FROM Guest a JOIN Guest b ON b.city=a.city AND b.guest_id>a.guest_id
+         FROM guest_details_view a JOIN guest_details_view b ON b.city=a.city AND b.state=a.state AND b.guest_id>a.guest_id
          ORDER BY a.city,a.name,b.name LIMIT 50"""),
     ]
     results = []
